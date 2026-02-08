@@ -7,7 +7,6 @@ app.use(cors());
 app.use(express.json());
 
 // Initialize Firebase Admin
-// On Render, we'll use the environment variable for credentials
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   admin.initializeApp({
@@ -51,41 +50,30 @@ const verifyFirebaseToken = async (req, res, next) => {
 };
 
 /* =============================================
-   💰 SECURE WALLET CREDIT API
+   💰 SECURE WALLET CREDIT API (Auto-Approved)
    ============================================= */
 app.post("/api/wallet/credit", verifyFirebaseToken, async (req, res) => {
   try {
     const { amount, paymentId } = req.body;
-    const uid = req.uid; // 🔐 Extracted from verified token
+    const uid = req.uid;
 
-    if (!amount || !paymentId) {
-      return res.status(400).json({ error: "Missing fields" });
+    if (!amount || !paymentId || amount <= 0) {
+      return res.status(400).json({ error: "Invalid credit request" });
     }
 
-    if (amount <= 0) {
-      return res.status(400).json({ error: "Invalid amount" });
-    }
-
-    // PATH FIX: Matching your frontend's 'wallet/current' path
     const walletRef = db.doc(`artifacts/${APP_ID}/users/${uid}/wallet/current`);
     const txCollection = db.collection(`artifacts/${APP_ID}/public/data/payment_requests`);
 
-    // 🔐 1. Prevent duplicate paymentId (Idempotency)
-    const existingTx = await txCollection
-      .where("paymentId", "==", paymentId)
-      .limit(1)
-      .get();
-
+    // 🔐 Idempotency Check
+    const existingTx = await txCollection.where("paymentId", "==", paymentId).limit(1).get();
     if (!existingTx.empty) {
       return res.status(409).json({ error: "Payment already processed" });
     }
 
-    // 🔐 2. Atomic Transaction
     await db.runTransaction(async (t) => {
       const walletSnap = await t.get(walletRef);
       const currentBalance = walletSnap.exists ? (Number(walletSnap.data().amount) || 0) : 0;
 
-      // Log the transaction publicly for Admin view
       t.set(txCollection.doc(), {
         uid,
         amount,
@@ -96,17 +84,56 @@ app.post("/api/wallet/credit", verifyFirebaseToken, async (req, res) => {
         timestamp: Date.now()
       });
 
-      // Update the user's private wallet
       t.set(walletRef, {
         amount: currentBalance + Number(amount),
         lastUpdated: Date.now()
       }, { merge: true });
     });
 
-    res.json({ success: true, newBalance: 'updated' });
+    res.json({ success: true });
   } catch (err) {
     console.error("Wallet Credit Error:", err);
     res.status(500).json({ error: "Internal Server Protocol Error" });
+  }
+});
+
+/* =============================================
+   💸 SECURE WITHDRAWAL REQUEST API
+   ============================================= */
+app.post("/api/wallet/withdraw/request", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { amount, upi } = req.body;
+    const uid = req.uid;
+
+    if (!amount || amount <= 0 || !upi) {
+      return res.status(400).json({ error: "Invalid withdrawal parameters" });
+    }
+
+    const walletRef = db.doc(`artifacts/${APP_ID}/users/${uid}/wallet/current`);
+    const walletSnap = await walletRef.get();
+    const balance = walletSnap.exists ? Number(walletSnap.data().amount || 0) : 0;
+
+    // Tactical Balance Check
+    if (amount > balance) {
+      return res.status(400).json({ error: "Insufficient balance for extraction" });
+    }
+
+    // Create secure request in payment_requests
+    // Mapping to payment_requests ensures history visibility in wallet.html
+    await db.collection(`artifacts/${APP_ID}/public/data/payment_requests`).add({
+      uid,
+      amount,
+      upi,
+      type: "withdraw",
+      status: "pending",
+      timestamp: Date.now(),
+      node: "Secure Backend"
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Withdraw request error:", err);
+    res.status(500).json({ error: "Internal server protocol error" });
   }
 });
 
