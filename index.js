@@ -68,7 +68,7 @@ app.post("/api/wallet/credit", verifyFirebaseToken, async (req, res) => {
 
     // PATH FIX: Matching your frontend's 'wallet/current' path
     const walletRef = db.doc(`artifacts/${APP_ID}/users/${uid}/wallet/current`);
-    const txCollection = db.collection(`artifacts/${APP_ID}/public/data/transactions`);
+    const txCollection = db.collection(`artifacts/${APP_ID}/public/data/payment_requests`);
 
     // 🔐 1. Prevent duplicate paymentId (Idempotency)
     const existingTx = await txCollection
