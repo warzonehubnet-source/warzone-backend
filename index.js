@@ -28,6 +28,48 @@ app.get("/", (req, res) => {
 });
 
 /* =============================================
+    🆕 USER INITIALIZATION API
+    Called after registration to initialize wallet
+    and leaderboard entry via Admin SDK (bypasses rules)
+   ============================================= */
+app.post("/api/user/init", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const { username, email } = req.body;
+
+    const walletRef = db.doc(`artifacts/${APP_ID}/users/${uid}/wallet/current`);
+    const leaderboardRef = db.doc(`artifacts/${APP_ID}/public/data/leaderboard/${uid}`);
+
+    // Only initialize if wallet doesn't exist yet (idempotent)
+    const walletSnap = await walletRef.get();
+    if (!walletSnap.exists) {
+      await walletRef.set({
+        available: 0,
+        locked: 0,
+        lastUpdated: Date.now()
+      });
+    }
+
+    // Only initialize leaderboard if not exists
+    const lbSnap = await leaderboardRef.get();
+    if (!lbSnap.exists) {
+      await leaderboardRef.set({
+        username: username || 'Recruit',
+        email: email || '',
+        wins: 0,
+        winnings: 0,
+        joined: Date.now()
+      });
+    }
+
+    res.json({ success: true, message: "Unit initialized successfully." });
+  } catch (err) {
+    console.error("User init error:", err);
+    res.status(500).json({ error: "Initialization failed" });
+  }
+});
+
+/* =============================================
     🔐 AUTHENTICATION MIDDLEWARE
    ============================================= */
 const verifyFirebaseToken = async (req, res, next) => {
