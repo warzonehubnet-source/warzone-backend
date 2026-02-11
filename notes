@@ -1,0 +1,222 @@
+🔴 1. index.js (BACKEND – MOST IMPORTANT)
+
+📍 Location: backend root
+
+WHY
+
+Wallet shows ₹0 even when user has money
+
+Match entry fees are NOT deducted
+
+Locked money logic not fully enforced
+
+Prize & refund consistency depends on this file
+
+WHAT TO UPDATE
+
+Deduct entry fee when player joins a match
+
+Move money:
+
+available → locked
+
+Refund on cancel / deny
+
+Clear locked money on payout
+
+Never let wallet go negative
+
+⚠️ If you update nothing else, update this file first
+
+🟠 2. package.json (BACKEND – CHECK ONLY)
+
+📍 Location: backend root
+
+WHY
+
+Backend wallet transactions rely on Firebase Admin SDK
+
+WHAT TO UPDATE
+
+Only verify these exist (do not upgrade blindly):
+
+"firebase-admin"
+"express"
+"cors"
+
+
+If already present → no change needed
+
+🔴 3. wallet.html
+
+📍 Frontend
+
+WHY
+
+Old wallet logic still exists
+
+Must reflect new available / locked system
+
+WHAT TO UPDATE
+
+Read:
+
+wallet.available
+
+wallet.locked
+
+Show:
+
+Available balance
+
+Locked balance
+
+Total (display only)
+
+❌ Remove any wallet write (setDoc, updateDoc)
+
+🔴 4. match-view.html
+
+📍 Frontend
+
+WHY
+
+Player can join matches without balance checks
+
+Entry fee not locked
+
+WHAT TO UPDATE
+
+Before join:
+
+Check wallet.available >= entryFee
+
+On join:
+
+Call backend API
+
+Backend handles wallet deduction
+
+❌ Never update wallet directly here
+
+🔴 5. ALL GAME PAGES (YOU EXPLICITLY ASKED THIS)
+
+You must update all 4:
+
+File
+freefire.html
+bgmi.html
+valorant.html
+minecraft.html
+WHY
+
+These pages still use OLD wallet logic
+
+They assume balance without locking money
+
+WHAT TO UPDATE
+
+Replace every:
+
+wallet.balance
+wallet.amount
+
+
+With:
+
+wallet.available
+
+
+Remove wallet writes
+
+Only allow backend-controlled join
+
+🟡 6. matches.html
+
+📍 Frontend
+
+WHY
+
+Entry fee visibility & join logic must align
+
+Old assumptions about balance
+
+WHAT TO UPDATE
+
+Display fee from match
+
+Do not allow join without wallet check
+
+Redirect join through match-view.html
+
+🟡 7. leaderboard.html
+
+📍 Frontend
+
+WHY
+
+Winnings must match backend prize logic
+
+WHAT TO UPDATE
+
+Read winnings only
+
+Never calculate or modify winnings here
+
+🟢 8. index.html (HOME PAGE)
+
+📍 Frontend
+
+STATUS
+
+✔ Already correct
+✔ Reads wallet.available
+
+ACTION
+
+❌ No change needed
+
+🟢 9. Firebase Rules
+
+📍 Firestore Rules
+
+STATUS
+
+✔ Correct
+✔ Secure
+✔ Production-ready
+
+ACTION
+
+❌ Do not change anything
+
+🧠 WHY YOU SEE ₹0 RIGHT NOW (FINAL ANSWER)
+
+Backend never moved money into available
+
+Frontend now reads only available
+
+Old balance exists but unused
+
+Result = ₹0 display
+
+✅ FINAL CHECKLIST (SHORT)
+MUST UPDATE
+
+✅ index.js
+
+✅ wallet.html
+
+✅ match-view.html
+
+✅ freefire.html
+
+✅ bgmi.html
+
+✅ valorant.html
+
+✅ minecraft.html
+
+✅ matches.html
+
+DO NOT TOUCH
