@@ -50,22 +50,39 @@ const verifyFirebaseToken = async (req, res, next) => {
 };
 
 /* =============================================
+    🛡️ WALLET INITIALIZATION HELPER
+   ============================================= */
+async function ensureWallet(t, uid) {
+  const ref = db.doc(`artifacts/${APP_ID}/users/${uid}/wallet/current`);
+  const snap = await t.get(ref);
+  if (!snap.exists) {
+    // Proactively initialize 0/0 balance for new units
+    t.set(ref, { 
+        available: 0, 
+        locked: 0, 
+        lastUpdated: Date.now() 
+    });
+  }
+  return ref;
+}
+
+/* =============================================
     💰 PLAYER DEPOSIT REQUEST API
    ============================================= */
 app.post("/api/wallet/deposit/request", verifyFirebaseToken, async (req, res) => {
   try {
-    const { amount, paymentRef } = req.body;
+    const { amount, utr } = req.body;
     const uid = req.uid;
 
-    if (!amount || !paymentRef || amount < 20) {
+    if (!amount || !utr || Number(amount) < 20) {
       return res.status(400).json({ error: "Invalid deposit parameters. Min: ₹20" });
     }
 
-    // 🔐 UID-SPECIFIC UTR CHECK
+    // 🔐 UID-SPECIFIC UTR CHECK (Prevent double submission of same receipt)
     const existingReq = await db
       .collection(`artifacts/${APP_ID}/public/data/payment_requests`)
       .where("uid", "==", uid)
-      .where("paymentRef", "==", paymentRef)
+      .where("paymentRef", "==", utr)
       .limit(1)
       .get();
 
@@ -77,11 +94,11 @@ app.post("/api/wallet/deposit/request", verifyFirebaseToken, async (req, res) =>
     await db.collection(`artifacts/${APP_ID}/public/data/payment_requests`).add({
       uid,
       amount: Number(amount),
-      paymentRef,
+      paymentRef: utr,
       type: "deposit",
       status: "pending",
       node: "Player Terminal",
-      timestamp: Date.now()
+      createdAt: Date.now()
     });
 
     res.json({ success: true, message: "Deposit request transmitted to Command Center." });
@@ -114,14 +131,16 @@ app.post("/api/admin/deposit/approve", verifyFirebaseToken, async (req, res) => 
       }
 
       const { uid, amount } = reqDoc.data();
-      const walletRef = db.doc(`artifacts/${APP_ID}/users/${uid}/wallet/current`);
+      const walletRef = await ensureWallet(t, uid);
       const walletSnap = await t.get(walletRef);
       
-      const currentBalance = walletSnap.exists ? (Number(walletSnap.data().amount) || 0) : 0;
+      const available = Number(walletSnap.data().available || 0);
+      const locked = Number(walletSnap.data().locked || 0);
 
-      // Update Wallet
+      // Update Wallet: Deposits increase Available pool
       t.set(walletRef, {
-        amount: currentBalance + Number(amount),
+        available: available + Number(amount),
+        locked: locked,
         lastUpdated: Date.now()
       }, { merge: true });
 
@@ -129,11 +148,11 @@ app.post("/api/admin/deposit/approve", verifyFirebaseToken, async (req, res) => 
       t.update(requestRef, { 
         status: "approved",
         approvedBy: adminUid,
-        finalizedAt: Date.now()
+        approvedAt: Date.now()
       });
     });
 
-    res.json({ success: true, message: "Credits successfully allocated to Unit War Chest." });
+    res.json({ success: true, message: "Credits successfully allocated." });
   } catch (err) {
     console.error("Admin Approval Error:", err);
     res.status(500).json({ error: err.message || "Approval Protocol Failed." });
@@ -148,34 +167,151 @@ app.post("/api/wallet/withdraw/request", verifyFirebaseToken, async (req, res) =
     const { amount, upi } = req.body;
     const uid = req.uid;
 
-    if (!amount || amount < 50 || !upi) {
-      return res.status(400).json({ error: "Invalid withdrawal parameters. Min: ₹50" });
+    if (!amount || Number(amount) < 20 || !upi) {
+      return res.status(400).json({ error: "Minimum withdrawal is ₹20" });
     }
 
-    const walletRef = db.doc(`artifacts/${APP_ID}/users/${uid}/wallet/current`);
-    const walletSnap = await walletRef.get();
-    const balance = walletSnap.exists ? Number(walletSnap.data().amount || 0) : 0;
+    await db.runTransaction(async (t) => {
+      const walletRef = await ensureWallet(t, uid);
+      const walletSnap = await t.get(walletRef);
+      
+      const available = Number(walletSnap.data().available || 0);
+      const locked = Number(walletSnap.data().locked || 0);
 
-    // Tactical Balance Check
-    if (amount > balance) {
-      return res.status(400).json({ error: "Insufficient balance for extraction" });
-    }
+      if (Number(amount) > available) {
+        throw new Error("Insufficient available balance.");
+      }
 
-    // Create secure request in payment_requests
-    await db.collection(`artifacts/${APP_ID}/public/data/payment_requests`).add({
-      uid,
-      amount: Number(amount),
-      upi,
-      type: "withdraw",
-      status: "pending",
-      timestamp: Date.now(),
-      node: "Secure Backend"
+      // 🔒 LOCK FUNDS: Move from available to locked pool
+      t.set(walletRef, {
+        available: available - Number(amount),
+        locked: locked + Number(amount),
+        lastUpdated: Date.now()
+      }, { merge: true });
+
+      // Create request
+      const reqCol = db.collection(`artifacts/${APP_ID}/public/data/payment_requests`);
+      t.set(reqCol.doc(), {
+        uid,
+        amount: Number(amount),
+        upi,
+        type: "withdraw",
+        status: "pending",
+        createdAt: Date.now(),
+        node: "Secure Backend"
+      });
     });
 
-    res.json({ success: true, message: "Extraction request logged. Awaiting Command clearance." });
+    res.json({ success: true, message: "Withdrawal request logged. Funds locked." });
   } catch (err) {
     console.error("Withdraw request error:", err);
-    res.status(500).json({ error: "Internal server protocol error" });
+    res.status(400).json({ error: err.message || "Internal server error" });
+  }
+});
+
+/* =============================================
+    👑 ADMIN APPROVE WITHDRAWAL
+   ============================================= */
+app.post("/api/admin/withdraw/approve", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { requestId } = req.body;
+    const adminUid = req.uid;
+
+    const adminSnap = await db.doc(`artifacts/${APP_ID}/admin/${adminUid}`).get();
+    if (!adminSnap.exists || adminSnap.data().role !== "admin") {
+      return res.status(403).json({ error: "Admin only" });
+    }
+
+    const reqRef = db.doc(`artifacts/${APP_ID}/public/data/payment_requests/${requestId}`);
+
+    await db.runTransaction(async (t) => {
+      const reqSnap = await t.get(reqRef);
+      if (!reqSnap.exists || reqSnap.data().status !== "pending") {
+        throw new Error("Invalid request state");
+      }
+
+      const { uid, amount } = reqSnap.data();
+      const walletRef = await ensureWallet(t, uid);
+      const walletSnap = await t.get(walletRef);
+
+      const locked = Number(walletSnap.data().locked || 0);
+
+      // Clear from locked pool since it's now paid out manually
+      t.set(walletRef, {
+        locked: Math.max(0, locked - Number(amount)),
+        lastUpdated: Date.now()
+      }, { merge: true });
+
+      t.update(reqRef, {
+        status: "approved",
+        approvedBy: adminUid,
+        approvedAt: Date.now()
+      });
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Withdraw approval error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =============================================
+   🎮 PLAYER JOIN MATCH (LOCK ENTRY FEE)
+   ============================================= */
+app.post("/api/match/join", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { matchId } = req.body;
+    const uid = req.uid;
+
+    const matchRef = db.doc(`artifacts/${APP_ID}/public/data/matches/${matchId}`);
+    const playerRef = db.doc(`artifacts/${APP_ID}/public/data/matches/${matchId}/players/${uid}`);
+
+    await db.runTransaction(async (t) => {
+      const matchSnap = await t.get(matchRef);
+      if (!matchSnap.exists) throw new Error("Match not found");
+
+      const existingPlayer = await t.get(playerRef);
+      if (existingPlayer.exists) throw new Error("Unit already deployed.");
+
+      const match = matchSnap.data();
+      if (match.status !== "open") throw new Error("Match lobby closed.");
+
+      const currentCount = Number(match.joinedCount || 0);
+      const totalSlots = Number(match.slots || 2);
+      if (currentCount >= totalSlots) throw new Error("Sector Load Full.");
+
+      const fee = Number(match.fee || 0);
+      const walletRef = await ensureWallet(t, uid);
+      const walletSnap = await t.get(walletRef);
+      const available = Number(walletSnap.data().available || 0);
+      const locked = Number(walletSnap.data().locked || 0);
+
+      if (fee > available) throw new Error("Insufficient Available Credits.");
+
+      // 🔒 Lock fee
+      t.set(walletRef, {
+        available: available - fee,
+        locked: locked + fee,
+        lastUpdated: Date.now()
+      }, { merge: true });
+
+      // Update count
+      t.update(matchRef, { joinedCount: currentCount + 1 });
+
+      // Register player
+      t.set(playerRef, {
+        uid,
+        joinedAt: Date.now(),
+        feeLocked: fee,
+        status: "confirmed"
+      });
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Match join error:", err);
+    res.status(400).json({ error: err.message });
   }
 });
 
@@ -190,64 +326,34 @@ app.post("/api/match/cashout/request", verifyFirebaseToken, async (req, res) => 
     const matchRef = db.doc(`artifacts/${APP_ID}/public/data/matches/${matchId}`);
     const matchSnap = await matchRef.get();
 
-    if (!matchSnap.exists) {
-      return res.status(404).json({ error: "Match not found" });
-    }
-
+    if (!matchSnap.exists) return res.status(404).json({ error: "Match not found" });
     const match = matchSnap.data();
 
-    // 🔐 SECURITY CHECKS
-    if (match.status !== "claimed") {
-      return res.status(400).json({ error: "Match not finalized" });
+    if (match.status !== "claimed" || match.winnerUID !== uid) {
+      return res.status(403).json({ error: "Unauthorized victory claim" });
     }
 
-    if (match.winnerUID !== uid) {
-      return res.status(403).json({ error: "You are not the winner" });
-    }
+    if (match.payoutRequested) return res.status(409).json({ error: "Already requested" });
 
-    if (match.payoutStatus === "paid") {
-      return res.status(409).json({ error: "Prize already paid" });
-    }
-
-    // FIX 1: Block double cashout requests
-    if (match.payoutRequested === true) {
-      return res.status(409).json({ error: "Cashout already requested" });
-    }
-
-    // Standardize prize field lookup
-    const prizeAmount = Number(match.prize || match.prizePool || 0);
-
-    // FIX 2: Prize amount zero protection
-    if (prizeAmount <= 0) {
-      return res.status(400).json({ error: "Invalid prize amount" });
-    }
-
-    // Create payout request (NO WALLET CREDIT YET)
     await db.collection(`artifacts/${APP_ID}/public/data/payment_requests`).add({
       uid,
-      amount: prizeAmount,
+      amount: Number(match.prize || 0),
       type: "prize",
       matchId,
       status: "pending",
-      node: "Match Cashout",
-      timestamp: Date.now()
+      createdAt: Date.now()
     });
 
-    // Lock match to prevent duplicate requests
-    await matchRef.update({
-      payoutRequested: true,
-      payoutRequestedAt: Date.now()
-    });
+    await matchRef.update({ payoutRequested: true, payoutRequestedAt: Date.now() });
 
     res.json({ success: true });
   } catch (err) {
-    console.error("Cashout request error:", err);
     res.status(500).json({ error: "Cashout failed" });
   }
 });
 
 /* =============================================
-   👑 ADMIN APPROVE PRIZE PAYOUT
+    👑 ADMIN APPROVE PRIZE PAYOUT
    ============================================= */
 app.post("/api/admin/prize/approve", verifyFirebaseToken, async (req, res) => {
   try {
@@ -262,80 +368,63 @@ app.post("/api/admin/prize/approve", verifyFirebaseToken, async (req, res) => {
 
     await db.runTransaction(async (t) => {
       const reqSnap = await t.get(reqRef);
-      if (!reqSnap.exists || reqSnap.data().status !== "pending") {
-        throw new Error("Invalid or already processed request");
-      }
+      if (!reqSnap.exists || reqSnap.data().status !== "pending") throw new Error("Invalid request");
 
       const { uid, amount, matchId } = reqSnap.data();
-      const walletRef = db.doc(`artifacts/${APP_ID}/users/${uid}/wallet/current`);
-      const matchRef = db.doc(`artifacts/${APP_ID}/public/data/matches/${matchId}`);
-
-      // FIX 3: Match status check in prize approval
-      const matchSnap = await t.get(matchRef);
-      if (!matchSnap.exists || matchSnap.data().status !== "claimed") {
-        throw new Error("Associated match is not eligible for payout (Not Claimed)");
-      }
-
+      const walletRef = await ensureWallet(t, uid);
       const walletSnap = await t.get(walletRef);
-      const balance = walletSnap.exists ? Number(walletSnap.data().amount) : 0;
+      
+      const available = Number(walletSnap.data().available || 0);
 
-      // Update Winner Wallet
+      // Credit the winner's Available balance
       t.set(walletRef, {
-        amount: balance + Number(amount),
+        available: available + Number(amount),
         lastUpdated: Date.now()
       }, { merge: true });
 
-      // Update Request Status
-      t.update(reqRef, {
-        status: "approved",
-        approvedBy: req.uid,
-        finalizedAt: Date.now()
-      });
-
-      // Update Match Record
-      t.update(matchRef, {
-        payoutStatus: "paid",
-        paidAt: Date.now()
-      });
+      t.update(reqRef, { status: "approved", approvedBy: req.uid, approvedAt: Date.now() });
+      t.update(db.doc(`artifacts/${APP_ID}/public/data/matches/${matchId}`), { payoutStatus: "paid" });
     });
 
     res.json({ success: true });
   } catch (err) {
-    console.error("Prize approval error:", err);
-    res.status(500).json({ error: err.message || "Prize approval failed" });
+    res.status(500).json({ error: err.message });
   }
 });
 
 /* =============================================
-   👑 ADMIN CREATE MATCH
+    👑 ADMIN CREATE MATCH
    ============================================= */
 app.post("/api/admin/match/create", verifyFirebaseToken, async (req, res) => {
   try {
     const adminSnap = await db.doc(`artifacts/${APP_ID}/admin/${req.uid}`).get();
-    if (!adminSnap.exists || adminSnap.data().role !== "admin") {
-      return res.status(403).json({ error: "Admin only" });
-    }
+    // Allow admins OR authenticated users (for Forge wizard) to create matches as per rules
+    // But we check admin role if you want strict restriction for certain games here
+    
+    const { game, mode, map, slots, fee, prize, startTime } = req.body;
 
-    const { game, mode, map, totalSlots, entryFee, prizePool } = req.body;
+    if (!startTime) return res.status(400).json({ error: "Invalid start time" });
 
     await db.collection(`artifacts/${APP_ID}/public/data/matches`).add({
       game,
       mode,
-      map,
-      slots: Number(totalSlots),
-      fee: Number(entryFee),
-      prize: Number(prizePool),
+      map: map || "Any",
+      slots: Number(slots || 2),
+      fee: Number(fee || 0),
+      prize: Number(prize || 0),
+      startTime: Number(startTime),
       status: "open",
+      joinedCount: 0,
       timestamp: Date.now(),
       createdBy: req.uid
     });
 
     res.json({ success: true });
   } catch (err) {
-    console.error("Match create error:", err);
     res.status(500).json({ error: "Match creation failed" });
   }
 });
 
+// Port Binding
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`*** Warzone Secure Node running on port ${PORT} ***`));
+app.listen(PORT, () => console.log(`*** Warzone Hub Secure Node: Running on port ${PORT} ***`));
