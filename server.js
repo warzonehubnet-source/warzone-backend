@@ -3,50 +3,35 @@ const admin = require('firebase-admin');
 const cors = require('cors');
 
 /**
- * WARZONE HUB - PRODUCTION BACKEND (RENDER)
- * ----------------------------------------
- * Handles high-security balance updates that bypass client rules.
+ * WARZONE HUB - SECURE BACKEND (RENDER)
+ * ------------------------------------
+ * Updated to use root collections: /users and /transactions
  */
 
+// Initialize Firebase Admin (Using Service Account)
+admin.initializeApp({
+  credential: admin.credential.applicationDefault()
+});
+
+const db = admin.firestore();
 const app = express();
 
-// Configure CORS
 app.use(cors({
-    origin: ['http://127.0.0.1:5500', 'http://localhost:5500', 'https://yourdomain.com'],
-    methods: ['GET', 'POST']
+    origin: ['http://127.0.0.1:5500', 'https://yourdomain.com'] 
 }));
 
 app.use(express.json());
 
-// INITIALIZATION WITH ROBUST PARSING
-try {
-  const sa = process.env.FIREBASE_SERVICE_ACCOUNT;
-  if (!sa) {
-    console.error("❌ ERROR: FIREBASE_SERVICE_ACCOUNT environment variable is missing.");
-  } else {
-    // Handle cases where Render provides the JSON as a string or double-encoded string
-    const serviceAccount = typeof sa === 'string' ? JSON.parse(sa) : sa;
-    
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-    console.log("✅ Backend successfully connected to Project: " + serviceAccount.project_id);
-  }
-} catch (e) {
-  console.error("❌ Auth Initialization Error: " + e.message);
-}
-
-const db = admin.firestore();
+const PORT = process.env.PORT || 3000;
 
 /**
- * POST /api/process-deposit
- * Approves a pending deposit and increments user balance.
+ * SECURE DEPOSIT PROCESSING
  */
 app.post('/api/process-deposit', async (req, res) => {
   const { userId, transactionId } = req.body;
 
   if (!userId || !transactionId) {
-    return res.status(400).json({ success: false, error: "userId and transactionId are required" });
+      return res.status(400).json({ success: false, error: "Missing required fields." });
   }
 
   try {
@@ -54,45 +39,32 @@ app.post('/api/process-deposit', async (req, res) => {
     const userRef = db.doc(`users/${userId}`);
 
     await db.runTransaction(async (t) => {
-      const txDoc = await t.get(txRef);
-      if (!txDoc.exists) throw new Error("Transaction not found");
-      if (txDoc.data().status !== 'pending') throw new Error("Transaction already processed");
+      const tx = await t.get(txRef);
+      if (!tx.exists) throw new Error('Transaction record not found.');
+      if (tx.data().status !== 'pending') throw new Error('Transaction already processed.');
 
-      const amount = parseFloat(txDoc.data().amount);
-      const userDoc = await t.get(userRef);
+      const amount = parseFloat(tx.data().amount);
 
-      // Update status to approved
       t.update(txRef, { 
-        status: 'approved', 
-        processedAt: admin.firestore.Timestamp.now() 
+          status: 'approved', 
+          processedAt: admin.firestore.Timestamp.now() 
       });
 
-      // Increment User Balance
-      if (!userDoc.exists) {
-        // Fallback for new user docs
-        t.set(userRef, { 
-            availableBalance: amount, 
-            totalBalance: amount, 
-            role: "user" 
-        });
-      } else {
-        t.update(userRef, { 
+      t.update(userRef, { 
           availableBalance: admin.firestore.FieldValue.increment(amount),
           totalBalance: admin.firestore.FieldValue.increment(amount)
-        });
-      }
+      });
     });
 
-    res.json({ success: true, message: "Balance updated successfully" });
-  } catch (err) {
-    console.error("Deposit Error:", err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.json({ success: true, message: 'Deposit processed successfully.' });
+  } catch (error) {
+    console.error("Deposit Error:", error.message);
+    res.status(400).json({ success: false, error: error.message });
   }
 });
 
 /**
- * POST /api/approve-withdrawal
- * Finalizes a withdrawal after manual payment.
+ * SECURE WITHDRAWAL APPROVAL
  */
 app.post('/api/approve-withdrawal', async (req, res) => {
     const { userId, transactionId } = req.body;
@@ -117,9 +89,5 @@ app.post('/api/approve-withdrawal', async (req, res) => {
     }
 });
 
-app.get('/', (req, res) => res.send("Warzone Hub API Terminal Online."));
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-    console.log(`🚀 Server listening on port ${PORT}`);
-});
+app.get('/', (req, res) => res.send("Warzone Hub API is Online."));
+app.listen(PORT, () => console.log(`Backend listening on port ${PORT}`));
